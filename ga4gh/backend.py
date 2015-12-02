@@ -6,15 +6,30 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-import os
 import json
-import random
+import os
 
-import ga4gh.protocol as protocol
-import ga4gh.datamodel.references as references
-import ga4gh.exceptions as exceptions
 import ga4gh.datamodel as datamodel
 import ga4gh.datamodel.datasets as datasets
+import ga4gh.datamodel.references as references
+import ga4gh.exceptions as exceptions
+import ga4gh.protocol as protocol
+
+
+def _parseIntegerArgument(args, key, defaultValue):
+    """
+    Attempts to parse the specified key in the specified argument
+    dictionary into an integer. If the argument cannot be parsed,
+    raises a BadRequestIntegerException. If the key is not present,
+    return the specified default value.
+    """
+    ret = defaultValue
+    if key in args:
+        try:
+            ret = int(args[key])
+        except ValueError:
+            raise exceptions.BadRequestIntegerException(key, args[key])
+    return ret
 
 
 def _parsePageToken(pageToken, numValues):
@@ -37,22 +52,6 @@ def _parsePageToken(pageToken, numValues):
     return values
 
 
-def _getVariantSet(request, variantSetIdMap):
-    if len(request.variantSetIds) != 1:
-        if len(request.variantSetIds) == 0:
-            msg = "Variant search requires specifying a variantSet"
-        else:
-            msg = ("Variant search over multiple variantSets "
-                   "not supported")
-        raise exceptions.NotImplementedException(msg)
-    variantSetId = request.variantSetIds[0]
-    try:
-        variantSet = variantSetIdMap[variantSetId]
-    except KeyError:
-        raise exceptions.VariantSetNotFoundException(variantSetId)
-    return variantSet
-
-
 class IntervalIterator(object):
     """
     Implements generator logic for types which accept a start/end
@@ -61,10 +60,9 @@ class IntervalIterator(object):
     us to pick up the iteration at any point, and is None for the last
     value in the iterator.
     """
-    def __init__(self, request, containerIdMap):
+    def __init__(self, request, parentContainer):
         self._request = request
-        self._containerIdMap = containerIdMap
-        self._container = self._getContainer()
+        self._parentContainer = parentContainer
         self._searchIterator = None
         self._currentObject = None
         self._nextObject = None
@@ -156,23 +154,13 @@ class ReadsIntervalIterator(IntervalIterator):
     """
     An interval iterator for reads
     """
-    def _getContainer(self):
-        if len(self._request.readGroupIds) != 1:
-            if len(self._request.readGroupIds) == 0:
-                msg = "Read search requires a readGroup to be specified"
-            else:
-                msg = "Read search over multiple readGroups not supported"
-            raise exceptions.NotImplementedException(msg)
-        readGroupId = self._request.readGroupIds[0]
-        try:
-            readGroup = self._containerIdMap[self._request.readGroupIds[0]]
-        except KeyError:
-            raise exceptions.ReadGroupNotFoundException(readGroupId)
-        return readGroup
+    def __init__(self, request, parentContainer, reference):
+        self._reference = reference
+        super(ReadsIntervalIterator, self).__init__(request, parentContainer)
 
     def _search(self, start, end):
-        return self._container.getReadAlignments(
-            self._request.referenceId, start, end)
+        return self._parentContainer.getReadAlignments(
+            self._reference, start, end)
 
     @classmethod
     def _getStart(cls, readAlignment):
@@ -180,20 +168,19 @@ class ReadsIntervalIterator(IntervalIterator):
 
     @classmethod
     def _getEnd(cls, readAlignment):
-        return cls._getStart(readAlignment) + \
-            len(readAlignment.alignedSequence)
+        return (
+            cls._getStart(readAlignment) +
+            len(readAlignment.alignedSequence))
 
 
 class VariantsIntervalIterator(IntervalIterator):
     """
     An interval iterator for variants
     """
-    def _getContainer(self):
-        return _getVariantSet(self._request, self._containerIdMap)
 
     def _search(self, start, end):
-        return self._container.getVariants(
-            self._request.referenceName, start, end, self._request.variantName,
+        return self._parentContainer.getVariants(
+            self._request.referenceName, start, end,
             self._request.callSetIds)
 
     @classmethod
@@ -211,61 +198,59 @@ class AbstractBackend(object):
     This class provides methods for all of the GA4GH protocol end points.
     """
     def __init__(self):
-        self._featureIdMap = {}
-        self._featureIds = []
-        self._referenceSetIdMap = {}
-        self._referenceSetIds = []
-        self._referenceIdMap = {}
-        self._referenceIds = []
         self._requestValidation = False
         self._responseValidation = False
         self._defaultPageSize = 100
         self._maxResponseLength = 2**20  # 1 MiB
         self._datasetIdMap = {}
+        self._datasetNameMap = {}
         self._datasetIds = []
+        self._referenceSetIdMap = {}
+        self._referenceSetNameMap = {}
+        self._referenceSetIds = []
 
-    def _getDatasetFromRequest(self, request):
-        if hasattr(request, "datasetIds"):
-            if len(request.datasetIds) != 1:
-                raise exceptions.NotExactlyOneDatasetException(
-                    request.datasetIds)
-            datasetId = request.datasetIds[0]
-            return self._datasetIdMap[datasetId]
-        else:
-            # TODO this can go away when all requests have datasetIds
-            # instead, we should throw an error here
-            datasetId = self._datasetIds[0]
-            return self._datasetIdMap[datasetId]
+    def addDataset(self, dataset):
+        """
+        Adds the specified dataset to this backend.
+        """
+        id_ = dataset.getId()
+        self._datasetIdMap[id_] = dataset
+        self._datasetNameMap[dataset.getLocalId()] = dataset
+        self._datasetIds.append(id_)
 
-    def getDatasetIds(self):
+    def addReferenceSet(self, referenceSet):
         """
-        Returns a list of datasets in this backend
+        Adds the specified reference set to this backend.
         """
-        return self._datasetIds
+        id_ = referenceSet.getId()
+        self._referenceSetIdMap[id_] = referenceSet
+        self._referenceSetNameMap[referenceSet.getLocalId()] = referenceSet
+        self._referenceSetIds.append(id_)
 
-    def getDataset(self, datasetId):
+    def setRequestValidation(self, requestValidation):
         """
-        Returns a dataset with id datasetId
+        Set enabling request validation
         """
-        return self._datasetIdMap[datasetId]
+        self._requestValidation = requestValidation
 
-    def getReferenceSets(self):
+    def setResponseValidation(self, responseValidation):
         """
-        Returns the list of ReferenceSets in this backend
+        Set enabling response validation
         """
-        return list(self._referenceSetIdMap.values())
+        self._responseValidation = responseValidation
 
-    def getReference(self, id_):
+    def setDefaultPageSize(self, defaultPageSize):
         """
-        Returns a reference with the given id_
+        Sets the default page size for request to the specified value.
         """
-        return self.runGetRequest(self._referenceIdMap, id_)
+        self._defaultPageSize = defaultPageSize
 
-    def getReferenceSet(self, id_):
+    def setMaxResponseLength(self, maxResponseLength):
         """
-        Returns a referenceSet with the given id_
+        Sets the approximate maximum response length to the specified
+        value.
         """
-        return self.runGetRequest(self._referenceSetIdMap, id_)
+        self._maxResponseLength = maxResponseLength
 
     def getFeature(self, id_):
         """
@@ -273,169 +258,98 @@ class AbstractBackend(object):
         """
         return self.runGetRequest(self._featureIdMap, id_)
 
-    def listReferenceBases(self, id_, requestArgs):
-        # parse arguments
-        try:
-            reference = self._referenceIdMap[id_]
-        except KeyError:
-            raise exceptions.ObjectWithIdNotFoundException(id_)
-        start = 0
-        end = datamodel.PysamDatamodelMixin.fastaMax
-        if 'start' in requestArgs:
-            startString = requestArgs['start']
-            try:
-                start = int(startString)
-            except ValueError:
-                raise exceptions.BadRequestIntegerException(
-                    'start', startString)
-        if 'end' in requestArgs:
-            endString = requestArgs['end']
-            try:
-                end = int(endString)
-            except ValueError:
-                raise exceptions.BadRequestIntegerException(
-                    'end', endString)
-        if 'pageToken' in requestArgs:
-            pageTokenStr = requestArgs['pageToken']
-            start = _parsePageToken(pageTokenStr, 1)[0]
-        chunkSize = self._maxResponseLength
+    def getDatasets(self):
+        """
+        Returns a list of datasets in this backend
+        """
+        return [self._datasetIdMap[id_] for id_ in self._datasetIds]
 
-        # get reference bases
-        gbEnd = min(start + chunkSize, end)
-        sequence = reference.getBases(start, gbEnd)
+    def getNumDatasets(self):
+        """
+        Returns the number of datasets in this backend.
+        """
+        return len(self._datasetIds)
 
-        # determine nextPageToken
-        if len(sequence) == chunkSize:
-            nextPageToken = start + chunkSize
-        elif len(sequence) > chunkSize:
-            raise exceptions.ServerError()  # should never happen
-        else:
-            nextPageToken = None
+    def getDataset(self, id_):
+        """
+        Returns a dataset with the specified ID, or raises a
+        DatasetNotFoundException if it does not exist.
+        """
+        if id_ not in self._datasetIdMap:
+            raise exceptions.DatasetNotFoundException(id_)
+        return self._datasetIdMap[id_]
 
-        # build response
-        response = protocol.ListReferenceBasesResponse()
-        response.offset = start
-        response.sequence = sequence
-        response.nextPageToken = nextPageToken
-        return response.toJsonString()
+    def getDatasetByIndex(self, index):
+        """
+        Returns the dataset at the specified index.
+        """
+        return self._datasetIdMap[self._datasetIds[index]]
 
-    def runGetRequest(self, idMap, id_):
+    def getDatasetByName(self, name):
         """
-        Runs a get request by indexing into the provided idMap and
-        returning a json string of that object
+        Returns the dataset with the specified name.
         """
-        try:
-            obj = idMap[id_]
-        except KeyError:
-            raise exceptions.ObjectWithIdNotFoundException(id_)
-        protocolElement = obj.toProtocolElement()
-        jsonString = protocolElement.toJsonString()
-        return jsonString
+        if name not in self._datasetNameMap:
+            raise exceptions.DatasetNameNotFoundException(name)
+        return self._datasetNameMap[name]
 
-    def runSearchRequest(
-            self, requestStr, requestClass, responseClass, objectGenerator):
+    def getReferenceSets(self):
         """
-        Runs the specified request. The request is a string containing
-        a JSON representation of an instance of the specified requestClass.
-        We return a string representation of an instance of the specified
-        responseClass in JSON format. Objects are filled into the page list
-        using the specified object generator, which must return
-        (object, nextPageToken) pairs, and be able to resume iteration from
-        any point using the nextPageToken attribute of the request object.
+        Returns the list of ReferenceSets in this backend
         """
-        self.startProfile()
-        try:
-            requestDict = json.loads(requestStr)
-        except ValueError:
-            raise exceptions.InvalidJsonException(requestStr)
-        self.validateRequest(requestDict, requestClass)
-        request = requestClass.fromJsonDict(requestDict)
-        if request.pageSize is None:
-            request.pageSize = self._defaultPageSize
-        if request.pageSize <= 0:
-            raise exceptions.BadPageSizeException(request.pageSize)
-        responseBuilder = protocol.SearchResponseBuilder(
-            responseClass, request.pageSize, self._maxResponseLength)
-        nextPageToken = None
-        for obj, nextPageToken in objectGenerator(request):
-            responseBuilder.addValue(obj)
-            if responseBuilder.isFull():
-                break
-        responseBuilder.setNextPageToken(nextPageToken)
-        responseString = responseBuilder.getJsonString()
-        self.validateResponse(responseString, responseClass)
-        self.endProfile()
-        return responseString
+        return [self._referenceSetIdMap[id_] for id_ in self._referenceSetIds]
 
-    def searchReadGroupSets(self, request):
+    def getNumReferenceSets(self):
         """
-        Returns a SearchReadGroupSetsResponse for the specified
-        SearchReadGroupSetsRequest object.
+        Returns the number of reference sets in this backend.
         """
-        return self.runSearchRequest(
-            request, protocol.SearchReadGroupSetsRequest,
-            protocol.SearchReadGroupSetsResponse,
-            self.readGroupSetsGenerator)
+        return len(self._referenceSetIds)
 
-    def searchReads(self, request):
+    def getReferenceSet(self, id_):
         """
-        Returns a SearchReadsResponse for the specified
-        SearchReadsRequest object.
+        Retuns the ReferenceSet with the specified ID, or raises a
+        ReferenceSetNotFoundException if it does not exist.
         """
-        return self.runSearchRequest(
-            request, protocol.SearchReadsRequest,
-            protocol.SearchReadsResponse,
-            self.readsGenerator)
+        if id_ not in self._referenceSetIdMap:
+            raise exceptions.ReferenceSetNotFoundException(id_)
+        return self._referenceSetIdMap[id_]
 
-    def searchReferenceSets(self, request):
+    def getReferenceSetByIndex(self, index):
         """
-        Returns a SearchReferenceSetsResponse for the specified
-        SearchReferenceSetsRequest object.
+        Returns the reference set at the specified index.
         """
-        return self.runSearchRequest(
-            request, protocol.SearchReferenceSetsRequest,
-            protocol.SearchReferenceSetsResponse,
-            self.referenceSetsGenerator)
+        return self._referenceSetIdMap[self._referenceSetIds[index]]
 
-    def searchReferences(self, request):
+    def getReferenceSetByName(self, name):
         """
-        Returns a SearchReferencesResponse for the specified
-        SearchReferencesRequest object.
+        Returns the reference set with the specified name.
         """
-        return self.runSearchRequest(
-            request, protocol.SearchReferencesRequest,
-            protocol.SearchReferencesResponse,
-            self.referencesGenerator)
+        if name not in self._referenceSetNameMap:
+            raise exceptions.ReferenceSetNameNotFoundException(name)
+        return self._referenceSetNameMap[name]
 
-    def searchVariantSets(self, request):
+    def startProfile(self):
         """
-        Returns a SearchVariantSetsResponse for the specified
-        SearchVariantSetsRequest object.
+        Profiling hook. Called at the start of the runSearchRequest method
+        and allows for detailed profiling of search performance.
         """
-        return self.runSearchRequest(
-            request, protocol.SearchVariantSetsRequest,
-            protocol.SearchVariantSetsResponse,
-            self.variantSetsGenerator)
+        pass
 
-    def searchVariants(self, request):
+    def endProfile(self):
         """
-        Returns a SearchVariantsResponse for the specified
-        SearchVariantsRequest object.
+        Profiling hook. Called at the end of the runSearchRequest method.
         """
-        return self.runSearchRequest(
-            request, protocol.SearchVariantsRequest,
-            protocol.SearchVariantsResponse,
-            self.variantsGenerator)
+        pass
 
-    def searchCallSets(self, request):
+    def validateRequest(self, jsonDict, requestClass):
         """
-        Returns a SearchCallSetsResponse for the specified
-        SearchCallSetsRequest Object.
+        Ensures the jsonDict corresponds to a valid instance of requestClass
+        Throws an error if the data is invalid
         """
-        return self.runSearchRequest(
-            request, protocol.SearchCallSetsRequest,
-            protocol.SearchCallSetsResponse,
-            self.callSetsGenerator)
+        if self._requestValidation:
+            if not requestClass.validate(jsonDict):
+                raise exceptions.RequestValidationFailureException(
+                    jsonDict, requestClass)
 
     def searchFeatures(self, request):
         """
@@ -475,34 +389,65 @@ class AbstractBackend(object):
             protocol.SearchFeatureGroupResponse,
             self.featureGroupGenerator)
 
-    def searchDatasets(self, request):
+    def validateResponse(self, jsonString, responseClass):
         """
-        Returns a SearchDatasetsResponse object for the specified
-        SearchDatasetsRequest Object.
+        Ensures the jsonDict corresponds to a valid instance of responseClass
+        Throws an error if the data is invalid
         """
-        return self.runSearchRequest(
-            request, protocol.SearchDatasetsRequest,
-            protocol.SearchDatasetsResponse,
-            self.datasetsGenerator)
+        if self._responseValidation:
+            jsonDict = json.loads(jsonString)
+            if not responseClass.validate(jsonDict):
+                raise exceptions.ResponseValidationFailureException(
+                    jsonDict, responseClass)
 
-    # Iterators over the data hieararchy
+    ###########################################################
+    #
+    # Iterators over the data hierarchy. These methods help to
+    # implement the search endpoints by providing iterators
+    # over the objects to be returned to the client.
+    #
+    ###########################################################
 
-    def _topLevelObjectGenerator(self, request, idMap, idList):
+    def _topLevelObjectGenerator(self, request, numObjects, getByIndexMethod):
         """
-        Generalisation of the code to iterate over the objects at the top
-        of the data hierarchy.
+        Returns a generator over the results for the specified request, which
+        is over a set of objects of the specified size. The objects are
+        returned by call to the specified method, which must take a single
+        integer as an argument. The returned generator yields a sequence of
+        (object, nextPageToken) pairs, which allows this iteration to be picked
+        up at any point.
         """
         currentIndex = 0
         if request.pageToken is not None:
             currentIndex, = _parsePageToken(request.pageToken, 1)
-        while currentIndex < len(idList):
-            objectId = idList[currentIndex]
-            object_ = idMap[objectId]
+        while currentIndex < numObjects:
+            object_ = getByIndexMethod(currentIndex)
             currentIndex += 1
             nextPageToken = None
-            if currentIndex < len(idList):
+            if currentIndex < numObjects:
                 nextPageToken = str(currentIndex)
             yield object_.toProtocolElement(), nextPageToken
+
+    def _objectListGenerator(self, request, objectList):
+        """
+        Returns a generator over the objects in the specified list using
+        _topLevelObjectGenerator to generate page tokens.
+        """
+        return self._topLevelObjectGenerator(
+            request, len(objectList), lambda index: objectList[index])
+
+    def _singleObjectGenerator(self, datamodelObject):
+        """
+        Returns a generator suitable for a search method in which the
+        result set is a single object.
+        """
+        yield (datamodelObject.toProtocolElement(), None)
+
+    def _noObjectGenerator(self):
+        """
+        Returns a generator yielding no results
+        """
+        return iter([])
 
     def datasetsGenerator(self, request):
         """
@@ -510,52 +455,94 @@ class AbstractBackend(object):
         defined by the specified request
         """
         return self._topLevelObjectGenerator(
-            request, self._datasetIdMap, self._datasetIds)
+            request, self.getNumDatasets(), self.getDatasetByIndex)
 
     def readGroupSetsGenerator(self, request):
         """
         Returns a generator over the (readGroupSet, nextPageToken) pairs
         defined by the specified request.
         """
-        dataset = self._getDatasetFromRequest(request)
-        return self._topLevelObjectGenerator(
-            request, dataset.getReadGroupSetIdMap(),
-            dataset.getReadGroupSetIds())
+        dataset = self.getDataset(request.datasetId)
+        if request.name is None:
+            return self._topLevelObjectGenerator(
+                request, dataset.getNumReadGroupSets(),
+                dataset.getReadGroupSetByIndex)
+        else:
+            try:
+                readGroupSet = dataset.getReadGroupSetByName(request.name)
+            except exceptions.ReadGroupSetNameNotFoundException:
+                return self._noObjectGenerator()
+            return self._singleObjectGenerator(readGroupSet)
 
     def referenceSetsGenerator(self, request):
         """
         Returns a generator over the (referenceSet, nextPageToken) pairs
         defined by the specified request.
         """
-        return self._topLevelObjectGenerator(
-            request, self._referenceSetIdMap, self._referenceSetIds)
+        results = []
+        for obj in self.getReferenceSets():
+            include = True
+            if request.md5checksum is not None:
+                if request.md5checksum != obj.getMd5Checksum():
+                    include = False
+            if request.accession is not None:
+                if request.accession not in obj.getSourceAccessions():
+                    include = False
+            if request.assemblyId is not None:
+                if request.assemblyId != obj.getAssemblyId():
+                    include = False
+            if include:
+                results.append(obj)
+        return self._objectListGenerator(request, results)
 
     def referencesGenerator(self, request):
         """
         Returns a generator over the (reference, nextPageToken) pairs
         defined by the specified request.
         """
-        return self._topLevelObjectGenerator(
-            request, self._referenceIdMap, self._referenceIds)
+        referenceSet = self.getReferenceSet(request.referenceSetId)
+        results = []
+        for obj in referenceSet.getReferences():
+            include = True
+            if request.md5checksum is not None:
+                if request.md5checksum != obj.getMd5Checksum():
+                    include = False
+            if request.accession is not None:
+                if request.accession not in obj.getSourceAccessions():
+                    include = False
+            if include:
+                results.append(obj)
+        return self._objectListGenerator(request, results)
 
     def variantSetsGenerator(self, request):
         """
         Returns a generator over the (variantSet, nextPageToken) pairs defined
         by the specified request.
         """
-        dataset = self._getDatasetFromRequest(request)
+        dataset = self.getDataset(request.datasetId)
         return self._topLevelObjectGenerator(
-            request, dataset.getVariantSetIdMap(),
-            dataset.getVariantSetIds())
+            request, dataset.getNumVariantSets(),
+            dataset.getVariantSetByIndex)
 
     def readsGenerator(self, request):
         """
         Returns a generator over the (read, nextPageToken) pairs defined
         by the specified request
         """
-        dataset = self._getDatasetFromRequest(request)
-        intervalIterator = ReadsIntervalIterator(
-            request, dataset.getReadGroupIdMap())
+        if request.referenceId is None:
+            raise exceptions.UnmappedReadsNotSupported()
+        if len(request.readGroupIds) != 1:
+            raise exceptions.NotImplementedException(
+                "Exactly one read group id must be specified")
+        compoundId = datamodel.ReadGroupCompoundId.parse(
+            request.readGroupIds[0])
+        dataset = self.getDataset(compoundId.datasetId)
+        readGroupSet = dataset.getReadGroupSet(compoundId.readGroupSetId)
+        readGroup = readGroupSet.getReadGroup(compoundId.readGroupId)
+        # Find the reference.
+        referenceSet = readGroupSet.getReferenceSet()
+        reference = referenceSet.getReference(request.referenceId)
+        intervalIterator = ReadsIntervalIterator(request, readGroup, reference)
         return intervalIterator
 
     def variantsGenerator(self, request):
@@ -563,9 +550,10 @@ class AbstractBackend(object):
         Returns a generator over the (variant, nextPageToken) pairs defined
         by the specified request.
         """
-        dataset = self._getDatasetFromRequest(request)
-        intervalIterator = VariantsIntervalIterator(
-            request, dataset.getVariantSetIdMap())
+        compoundId = datamodel.VariantSetCompoundId.parse(request.variantSetId)
+        dataset = self.getDataset(compoundId.datasetId)
+        variantSet = dataset.getVariantSet(compoundId.variantSetId)
+        intervalIterator = VariantsIntervalIterator(request, variantSet)
         return intervalIterator
 
     def callSetsGenerator(self, request):
@@ -573,15 +561,19 @@ class AbstractBackend(object):
         Returns a generator over the (callSet, nextPageToken) pairs defined
         by the specified request.
         """
-        if request.name is not None:
-            raise exceptions.NotImplementedException(
-                "Searching over names is not supported")
-        dataset = self._getDatasetFromRequest(request)
-        variantSet = _getVariantSet(
-            request, dataset.getVariantSetIdMap())
-        return self._topLevelObjectGenerator(
-            request, variantSet.getCallSetIdMap(),
-            variantSet.getCallSetIds())
+        compoundId = datamodel.VariantSetCompoundId.parse(request.variantSetId)
+        dataset = self.getDataset(compoundId.datasetId)
+        variantSet = dataset.getVariantSet(compoundId.variantSetId)
+        if request.name is None:
+            return self._topLevelObjectGenerator(
+                request, variantSet.getNumCallSets(),
+                variantSet.getCallSetByIndex)
+        else:
+            try:
+                callSet = variantSet.getCallSetByName(request.name)
+            except exceptions.CallSetNameNotFoundException:
+                return self._noObjectGenerator()
+            return self._singleObjectGenerator(callSet)
 
     def rnaQuantificationGenerator(self, request):
         """
@@ -669,64 +661,237 @@ class AbstractBackend(object):
                 yield featureGroup, nextPageToken
                 featureGroupData = nextFeatureGroupData
 
-    def startProfile(self):
-        """
-        Profiling hook. Called at the start of the runSearchRequest method
-        and allows for detailed profiling of search performance.
-        """
-        pass
 
-    def endProfile(self):
-        """
-        Profiling hook. Called at the end of the runSearchRequest method.
-        """
-        pass
+    ###########################################################
+    #
+    # Public API methods. Each of these methods implements the
+    # corresponding API end point, and return data ready to be
+    # written to the wire.
+    #
+    ###########################################################
 
-    def validateRequest(self, jsonDict, requestClass):
+    def runGetRequest(self, obj):
         """
-        Ensures the jsonDict corresponds to a valid instance of requestClass
-        Throws an error if the data is invalid
+        Runs a get request by converting the specified datamodel
+        object into its protocol representation.
         """
-        if self._requestValidation:
-            if not requestClass.validate(jsonDict):
-                raise exceptions.RequestValidationFailureException(
-                    jsonDict, requestClass)
+        protocolElement = obj.toProtocolElement()
+        jsonString = protocolElement.toJsonString()
+        return jsonString
 
-    def validateResponse(self, jsonString, responseClass):
+    def runSearchRequest(
+            self, requestStr, requestClass, responseClass, objectGenerator):
         """
-        Ensures the jsonDict corresponds to a valid instance of responseClass
-        Throws an error if the data is invalid
+        Runs the specified request. The request is a string containing
+        a JSON representation of an instance of the specified requestClass.
+        We return a string representation of an instance of the specified
+        responseClass in JSON format. Objects are filled into the page list
+        using the specified object generator, which must return
+        (object, nextPageToken) pairs, and be able to resume iteration from
+        any point using the nextPageToken attribute of the request object.
         """
-        if self._responseValidation:
-            jsonDict = json.loads(jsonString)
-            if not responseClass.validate(jsonDict):
-                raise exceptions.ResponseValidationFailureException(
-                    jsonDict, responseClass)
+        self.startProfile()
+        try:
+            requestDict = json.loads(requestStr)
+        except ValueError:
+            raise exceptions.InvalidJsonException(requestStr)
+        self.validateRequest(requestDict, requestClass)
+        request = requestClass.fromJsonDict(requestDict)
+        if request.pageSize is None:
+            request.pageSize = self._defaultPageSize
+        if request.pageSize <= 0:
+            raise exceptions.BadPageSizeException(request.pageSize)
+        responseBuilder = protocol.SearchResponseBuilder(
+            responseClass, request.pageSize, self._maxResponseLength)
+        nextPageToken = None
+        for obj, nextPageToken in objectGenerator(request):
+            responseBuilder.addValue(obj)
+            if responseBuilder.isFull():
+                break
+        responseBuilder.setNextPageToken(nextPageToken)
+        responseString = responseBuilder.getJsonString()
+        self.validateResponse(responseString, responseClass)
+        self.endProfile()
+        return responseString
 
-    def setRequestValidation(self, requestValidation):
+    def runListReferenceBases(self, id_, requestArgs):
         """
-        Set enabling request validation
+        Runs a listReferenceBases request for the specified ID and
+        request arguments.
         """
-        self._requestValidation = requestValidation
+        compoundId = datamodel.ReferenceCompoundId.parse(id_)
+        referenceSet = self.getReferenceSet(compoundId.referenceSetId)
+        reference = referenceSet.getReference(id_)
+        start = _parseIntegerArgument(requestArgs, 'start', 0)
+        end = _parseIntegerArgument(requestArgs, 'end', reference.getLength())
+        if 'pageToken' in requestArgs:
+            pageTokenStr = requestArgs['pageToken']
+            start = _parsePageToken(pageTokenStr, 1)[0]
 
-    def setResponseValidation(self, responseValidation):
-        """
-        Set enabling response validation
-        """
-        self._responseValidation = responseValidation
+        chunkSize = self._maxResponseLength
+        nextPageToken = None
+        if start + chunkSize < end:
+            end = start + chunkSize
+            nextPageToken = str(start + chunkSize)
+        sequence = reference.getBases(start, end)
 
-    def setDefaultPageSize(self, defaultPageSize):
-        """
-        Sets the default page size for request to the specified value.
-        """
-        self._defaultPageSize = defaultPageSize
+        # build response
+        response = protocol.ListReferenceBasesResponse()
+        response.offset = start
+        response.sequence = sequence
+        response.nextPageToken = nextPageToken
+        return response.toJsonString()
 
-    def setMaxResponseLength(self, maxResponseLength):
+    # Get requests.
+
+    def runGetCallset(self, id_):
         """
-        Sets the approximate maximum response length to the specified
-        value.
+        Returns a callset with the given id
         """
-        self._maxResponseLength = maxResponseLength
+        compoundId = datamodel.CallSetCompoundId.parse(id_)
+        dataset = self.getDataset(compoundId.datasetId)
+        variantSet = dataset.getVariantSet(compoundId.variantSetId)
+        callSet = variantSet.getCallSet(id_)
+        return self.runGetRequest(callSet)
+
+    def runGetVariant(self, id_):
+        """
+        Returns a variant with the given id
+        """
+        compoundId = datamodel.VariantCompoundId.parse(id_)
+        dataset = self.getDataset(compoundId.datasetId)
+        variantSet = dataset.getVariantSet(compoundId.variantSetId)
+        gaVariant = variantSet.getVariant(compoundId)
+        # TODO variant is a special case here, as it's returning a
+        # protocol element rather than a datamodel object. We should
+        # fix this for consistency.
+        jsonString = gaVariant.toJsonString()
+        return jsonString
+
+    def runGetReadGroupSet(self, id_):
+        """
+        Returns a readGroupSet with the given id_
+        """
+        compoundId = datamodel.ReadGroupSetCompoundId.parse(id_)
+        dataset = self.getDataset(compoundId.datasetId)
+        readGroupSet = dataset.getReadGroupSet(id_)
+        return self.runGetRequest(readGroupSet)
+
+    def runGetReadGroup(self, id_):
+        """
+        Returns a read group with the given id_
+        """
+        compoundId = datamodel.ReadGroupCompoundId.parse(id_)
+        dataset = self.getDataset(compoundId.datasetId)
+        readGroupSet = dataset.getReadGroupSet(compoundId.readGroupSetId)
+        readGroup = readGroupSet.getReadGroup(id_)
+        return self.runGetRequest(readGroup)
+
+    def runGetReference(self, id_):
+        """
+        Runs a getReference request for the specified ID.
+        """
+        compoundId = datamodel.ReferenceCompoundId.parse(id_)
+        referenceSet = self.getReferenceSet(compoundId.referenceSetId)
+        reference = referenceSet.getReference(id_)
+        return self.runGetRequest(reference)
+
+    def runGetReferenceSet(self, id_):
+        """
+        Runs a getReferenceSet request for the specified ID.
+        """
+        referenceSet = self.getReferenceSet(id_)
+        return self.runGetRequest(referenceSet)
+
+    def runGetVariantSet(self, id_):
+        """
+        Runs a getVariantSet request for the specified ID.
+        """
+        compoundId = datamodel.VariantSetCompoundId.parse(id_)
+        dataset = self.getDataset(compoundId.datasetId)
+        variantSet = dataset.getVariantSet(id_)
+        return self.runGetRequest(variantSet)
+
+    def runGetDataset(self, id_):
+        """
+        Runs a getDataset request for the specified ID.
+        """
+        dataset = self.getDataset(id_)
+        return self.runGetRequest(dataset)
+
+    # Search requests.
+
+    def runSearchReadGroupSets(self, request):
+        """
+        Runs the specified SearchReadGroupSetsRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchReadGroupSetsRequest,
+            protocol.SearchReadGroupSetsResponse,
+            self.readGroupSetsGenerator)
+
+    def runSearchReads(self, request):
+        """
+        Runs the specified SearchReadsRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchReadsRequest,
+            protocol.SearchReadsResponse,
+            self.readsGenerator)
+
+    def runSearchReferenceSets(self, request):
+        """
+        Runs the specified SearchReferenceSetsRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchReferenceSetsRequest,
+            protocol.SearchReferenceSetsResponse,
+            self.referenceSetsGenerator)
+
+    def runSearchReferences(self, request):
+        """
+        Runs the specified SearchReferenceRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchReferencesRequest,
+            protocol.SearchReferencesResponse,
+            self.referencesGenerator)
+
+    def runSearchVariantSets(self, request):
+        """
+        Runs the specified SearchVariantSetsRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchVariantSetsRequest,
+            protocol.SearchVariantSetsResponse,
+            self.variantSetsGenerator)
+
+    def runSearchVariants(self, request):
+        """
+        Runs the specified SearchVariantRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchVariantsRequest,
+            protocol.SearchVariantsResponse,
+            self.variantsGenerator)
+
+    def runSearchCallSets(self, request):
+        """
+        Runs the specified SearchCallSetsRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchCallSetsRequest,
+            protocol.SearchCallSetsResponse,
+            self.callSetsGenerator)
+
+    def runSearchDatasets(self, request):
+        """
+        Runs the specified SearchDatasetsRequest.
+        """
+        return self.runSearchRequest(
+            request, protocol.SearchDatasetsRequest,
+            protocol.SearchDatasetsResponse,
+            self.datasetsGenerator)
 
 
 class EmptyBackend(AbstractBackend):
@@ -739,37 +904,35 @@ class SimulatedBackend(AbstractBackend):
     """
     A GA4GH backend backed by no data; used mostly for testing
     """
-    def __init__(self, randomSeed=0, numCalls=1, variantDensity=0.5,
-                 numVariantSets=1, numReferenceSets=1,
-                 numReferencesPerReferenceSet=1, numAlignments=2):
+    def __init__(
+            self, randomSeed=0, numDatasets=2,
+            numVariantSets=1, numCalls=1, variantDensity=0.5,
+            numReferenceSets=1, numReferencesPerReferenceSet=1,
+            numReadGroupSets=1, numReadGroupsPerReadGroupSet=1,
+            numAlignments=2):
         super(SimulatedBackend, self).__init__()
 
-        # Datasets
-        dataset1 = datasets.SimulatedDataset(
-            "simulatedDataset1", randomSeed, numCalls,
-            variantDensity, numVariantSets, numAlignments)
-        dataset2 = datasets.SimulatedDataset(
-            "simulatedDataset2", randomSeed, numCalls,
-            variantDensity, numVariantSets, numAlignments)
-        self._datasetIdMap[dataset1.getId()] = dataset1
-        self._datasetIdMap[dataset2.getId()] = dataset2
-        self._datasetIds = sorted(self._datasetIdMap.keys())
-
         # References
-        randomGenerator = random.Random()
-        randomGenerator.seed(randomSeed)
         for i in range(numReferenceSets):
-            referenceSetId = "referenceSet{}".format(i)
-            referenceSetSeed = randomGenerator.getrandbits(32)
+            localId = "referenceSet{}".format(i)
+            seed = randomSeed + i
             referenceSet = references.SimulatedReferenceSet(
-                referenceSetId, referenceSetSeed,
-                numReferencesPerReferenceSet)
-            self._referenceSetIdMap[referenceSetId] = referenceSet
-            for reference in referenceSet.getReferences():
-                referenceId = reference.getId()
-                self._referenceIdMap[referenceId] = reference
-        self._referenceSetIds = sorted(self._referenceSetIdMap.keys())
-        self._referenceIds = sorted(self._referenceIdMap.keys())
+                localId, seed, numReferencesPerReferenceSet)
+            self.addReferenceSet(referenceSet)
+
+        # Datasets
+        for i in range(numDatasets):
+            seed = randomSeed + i
+            localId = "simulatedDataset{}".format(i)
+            referenceSet = self.getReferenceSetByIndex(i % numReferenceSets)
+            dataset = datasets.SimulatedDataset(
+                localId, referenceSet=referenceSet, randomSeed=seed,
+                numCalls=numCalls, variantDensity=variantDensity,
+                numVariantSets=numVariantSets,
+                numReadGroupSets=numReadGroupSets,
+                numReadGroupsPerReadGroupSet=numReadGroupsPerReadGroupSet,
+                numAlignments=numAlignments)
+            self.addDataset(dataset)
 
         # Features
         self._featureIdMap = {}
@@ -783,31 +946,14 @@ class FileSystemBackend(AbstractBackend):
     def __init__(self, dataDir):
         super(FileSystemBackend, self).__init__()
         self._dataDir = dataDir
-        # TODO this code is very ugly and should be regarded as a temporary
-        # stop-gap until we deal with iterating over the data tree properly.
-
-        # References
-        referencesDirName = "references"
-        referenceSetDir = os.path.join(self._dataDir, referencesDirName)
-        for referenceSetId in os.listdir(referenceSetDir):
-            relativePath = os.path.join(referenceSetDir, referenceSetId)
-            if os.path.isdir(relativePath):
-                referenceSet = references.HtslibReferenceSet(
-                    referenceSetId, relativePath)
-                self._referenceSetIdMap[referenceSetId] = referenceSet
-                for reference in referenceSet.getReferences():
-                    referenceId = reference.getId()
-                    self._referenceIdMap[referenceId] = reference
-        self._referenceSetIds = sorted(self._referenceSetIdMap.keys())
-        self._referenceIds = sorted(self._referenceIdMap.keys())
-
-        # Datasets
-        datasetDirs = [
-            os.path.join(self._dataDir, directory)
-            for directory in os.listdir(self._dataDir)
-            if os.path.isdir(os.path.join(self._dataDir, directory)) and
-            directory != referencesDirName]
-        for datasetDir in datasetDirs:
-            dataset = datasets.FileSystemDataset(datasetDir)
-            self._datasetIdMap[dataset.getId()] = dataset
-        self._datasetIds = sorted(self._datasetIdMap.keys())
+        sourceDirNames = ["referenceSets", "datasets"]
+        constructors = [
+            references.HtslibReferenceSet, datasets.FileSystemDataset]
+        objectAdders = [self.addReferenceSet, self.addDataset]
+        for sourceDirName, constructor, objectAdder in zip(
+                sourceDirNames, constructors, objectAdders):
+            sourceDir = os.path.join(self._dataDir, sourceDirName)
+            for setName in os.listdir(sourceDir):
+                relativePath = os.path.join(sourceDir, setName)
+                if os.path.isdir(relativePath):
+                    objectAdder(constructor(setName, relativePath, self))

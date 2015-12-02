@@ -1,7 +1,6 @@
 """
 Tests related to exceptions
 """
-
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
@@ -53,8 +52,9 @@ class TestExceptionHandler(unittest.TestCase):
         self.assertEquals(gaException.message, message)
 
 
-def isClassAndExceptionSubclass(class_):
-    return inspect.isclass(class_) and issubclass(class_, Exception)
+def isClassAndBaseServerExceptionSubclass(class_):
+    return (inspect.isclass(class_) and
+            issubclass(class_, exceptions.BaseServerException))
 
 
 class TestExceptionConsistency(unittest.TestCase):
@@ -67,7 +67,7 @@ class TestExceptionConsistency(unittest.TestCase):
     """
     def _getExceptionClasses(self):
         classes = inspect.getmembers(
-            exceptions, isClassAndExceptionSubclass)
+            exceptions, isClassAndBaseServerExceptionSubclass)
         return [class_ for _, class_ in classes]
 
     def testCodeInvariants(self):
@@ -110,6 +110,17 @@ class TestExceptionConsistency(unittest.TestCase):
             self.assertGreater(len(message), 0)
             self.assertEqual(instance.getErrorCode(), class_.getErrorCode())
 
+    def testGetExceptionClass(self):
+        for class_ in self._getExceptionClasses():
+            code = class_.getErrorCode()
+            self.assertEqual(class_, exceptions.getExceptionClass(code))
+
+
+class TestValidationExceptions(unittest.TestCase):
+    """
+    Tests for exceptions that occur when validation fails.
+    """
+
     def testValidationFailureExceptionMessages(self):
         # RequestValidationFailureException
         wrongString = "thisIsWrong"
@@ -119,9 +130,8 @@ class TestExceptionConsistency(unittest.TestCase):
         jsonDict = obj.toJsonDict()
         instance = exceptions.RequestValidationFailureException(
             jsonDict, objClass)
-        self.assertIn(
-            "invalid fields: {u'start': u'thisIsWrong'}",
-            instance.message)
+        self.assertIn("invalid fields:", instance.message)
+        self.assertIn("u'start': u'thisIsWrong'", instance.message)
         self.assertEqual(instance.message.count(wrongString), 2)
 
         # ResponseValidationFailureException

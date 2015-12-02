@@ -1,9 +1,13 @@
 import re
-from ez_setup import use_setuptools
-from setuptools import setup
 
-MIN_SETUPTOOLS_VERSION = "0.7"
-use_setuptools(version=MIN_SETUPTOOLS_VERSION)
+# First, we try to use setuptools. If it's not available locally,
+# we fall back on ez_setup.
+try:
+    from setuptools import setup
+except ImportError:
+    from ez_setup import use_setuptools
+    use_setuptools()
+    from setuptools import setup
 
 
 # Following the recommendations of PEP 396 we parse the version number
@@ -21,13 +25,13 @@ def parseVersion(moduleFile):
     match = re.findall("__version__ = '([^']+)'", s)
     return match[0]
 
-f = open("README.txt")
+f = open("README.pypi.rst")
 ga4ghReadme = f.read()
 f.close()
 ga4ghVersion = parseVersion("ga4gh/__init__.py")
 # Flask must come after all other requirements that have "flask" as a prefix
 # due to a setuptools bug.
-requirements = ["avro", "flask-cors", "flask", "humanize",
+requirements = ["avro", "flask-cors", "oic", "flask", "humanize",
                 "pysam>=0.8.2", "requests"]
 
 setup(
