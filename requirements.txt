@@ -35,7 +35,7 @@ pyjwkest==1.0.1
 # Flask must come after all other requirements that have "flask" as a
 # prefix due to a setuptools bug.
 Flask-Cors==2.0.1
-Flask==0.10.1
+Flask==1.0
 avro==1.7.7
 humanize==0.5.1
 pysam==0.9.0
